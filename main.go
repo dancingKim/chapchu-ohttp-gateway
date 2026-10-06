@@ -4,19 +4,16 @@
 package main
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime/debug"
 	"strconv"
-	"strings"
 
 	"github.com/chris-wood/ohttp-go"
 	"github.com/cloudflare/circl/hpke"
@@ -174,41 +171,10 @@ func main() {
 		port = defaultPort
 	}
 
-	logSecrets := getBoolEnv(logSecretsEnvironmentVariable, false)
-
-	var seed []byte
-	if seedHex := os.Getenv(secretSeedEnvironmentVariable); seedHex != "" {
-		if logSecrets {
-			slog.Info("Using Secret Key Seed", "seed", seedHex)
-		} else {
-			slog.Info("Using Secret Key Seed provided in environment variable")
-		}
-		var err error
-		seed, err = hex.DecodeString(seedHex)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		seed = make([]byte, defaultSeedLength)
-		rand.Read(seed)
-	}
-
-	var allowedOrigins map[string]bool
-	var originAllowList string
-	if originAllowList = os.Getenv(targetOriginAllowList); originAllowList != "" {
-		origins := strings.Split(originAllowList, ",")
-		allowedOrigins = make(map[string]bool)
-		for _, origin := range origins {
-			allowedOrigins[origin] = true
-		}
-	}
-
-	var targetRewrites map[string]TargetRewrite
-	if targetRewritesJson := os.Getenv(targetRewritesVariables); targetRewritesJson != "" {
-		if err := json.Unmarshal([]byte(targetRewritesJson), &targetRewrites); err != nil {
-			slog.Error("Failed to parse target rewrites", "error", err)
-			os.Exit(1)
-		}
+	seed, err := guardianGatewayConfiguration()
+	if err != nil {
+		slog.Error("Invalid gateway security configuration")
+		os.Exit(1)
 	}
 
 	var certFile string
@@ -223,7 +189,7 @@ func main() {
 		enableTLSServe = false
 	}
 
-	debugResponse := getBoolEnv(gatewayDebugEnvironmentVariable, false)
+	debugResponse := false
 
 	configID := uint8(getUintEnv(configurationIdEnvironmentVariable, 0))
 	config, err := ohttp.NewConfigFromSeed(configID, hpke.KEM_X25519_KYBER768_DRAFT00, hpke.KDF_HKDF_SHA256, hpke.AEAD_AES128GCM, seed)
@@ -244,10 +210,10 @@ func main() {
 	}
 
 	// Create the default HTTP handler
-	httpHandler := FilteredHttpRequestHandler{
-		client:         HTTPClientRequestHandler{client: &http.Client{}},
-		allowedOrigins: allowedOrigins,
-		targetRewrites: targetRewrites,
+	httpHandler := GuardianPIRRequestHandler{
+		client: HTTPClientRequestHandler{client: boundedHTTPClient()},
+		origin: guardianPIRHost,
+		target: url.URL{Scheme: "http", Host: guardianPIRTarget},
 	}
 
 	// Create the default gateway and its request handler chain
@@ -275,17 +241,6 @@ func main() {
 		}
 	} else {
 		panic("Unsupported application content handler")
-	}
-
-	// Create the echo handler chain
-	echoHandler := DefaultEncapsulationHandler{
-		gateway:    gateway,
-		appHandler: EchoAppHandler{},
-	}
-
-	// Create the metadata handler chain
-	metadataHandler := MetadataEncapsulationHandler{
-		gateway: gateway,
 	}
 
 	// Configure metrics
@@ -327,61 +282,16 @@ func main() {
 		}
 	}
 
-	// Load endpoint configuration defaults
-	gatewayEndpoint := getStringEnv(gatewayEndpointEnvVariable, defaultGatewayEndpoint)
-	configEndpoint := getStringEnv(configEndpointEnvVariable, defaultConfigEndpoint)
-	legacyConfigEndpoint := getStringEnv(legacyConfigEndpointEnvVariable, defaultLegacyConfigEndpoint)
-	echoEndpoint := getStringEnv(echoEndpointEnvVariable, defaultEchoEndpoint)
-	metadataEndpoint := getStringEnv(metadataEndpointEnvVariable, defaultMetadataEndpoint)
-	healthEndpoint := getStringEnv(healthEndpointEnvVariable, defaultHealthEndpoint)
-
-	// Install configuration endpoints
-	handlers := make(map[string]EncapsulationHandler)
-	handlers[gatewayEndpoint] = targetHandler    // Content-specific handler
-	handlers[echoEndpoint] = echoHandler         // Content-agnostic handler
-	handlers[metadataEndpoint] = metadataHandler // Metadata handler
 	target := &gatewayResource{
-		legacyKeyID:           legacyConfigID,
-		gateway:               gateway,
-		encapsulationHandlers: handlers,
-		debugResponse:         debugResponse,
-		metricsFactory:        metricsFactory,
+		legacyKeyID: legacyConfigID, gateway: gateway,
+		encapsulationHandlers: map[string]EncapsulationHandler{defaultGatewayEndpoint: targetHandler},
+		debugResponse:         debugResponse, metricsFactory: metricsFactory,
 	}
-
-	endpoints := make(map[string]string)
-	endpoints["Target"] = gatewayEndpoint
-	endpoints["Health"] = healthEndpoint
-	endpoints["Config"] = configEndpoint
-	endpoints["LegacyConfig"] = legacyConfigEndpoint
-	endpoints["Echo"] = echoEndpoint
-	endpoints["Metadata"] = metadataEndpoint
-
-	server := gatewayServer{
-		requestLabel:  requestLabel,
-		responseLabel: responseLabel,
-		endpoints:     endpoints,
-		target:        target,
-	}
-
-	http.HandleFunc(gatewayEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(echoEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(metadataEndpoint, server.target.gatewayHandler)
-	http.HandleFunc(healthEndpoint, server.healthCheckHandler)
-	http.HandleFunc(legacyConfigEndpoint, target.legacyConfigHandler)
-	http.HandleFunc(configEndpoint, target.configHandler)
-	http.HandleFunc("/", server.indexHandler)
-
-	var b bytes.Buffer
-	server.formatConfiguration(io.Writer(&b))
-	slog.Debug(b.String())
-
+	server := boundedGatewayServer(fmt.Sprintf(":%s", port), guardianMux(target))
 	if enableTLSServe {
-		slog.Debug("Listening", "cert", certFile, "key", "keyFile", "port", port)
-		slog.Error("error serving TLS", "error", http.ListenAndServeTLS(fmt.Sprintf(":%s", port), certFile, keyFile, nil))
-		os.Exit(1)
+		slog.Error("Gateway stopped", "error", server.ListenAndServeTLS(certFile, keyFile))
 	} else {
-		slog.Debug("Listening without enabling TLS", "port", port)
-		slog.Error("error serving non-TLS", "error", http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
-		os.Exit(1)
+		slog.Error("Gateway stopped", "error", server.ListenAndServe())
 	}
+	os.Exit(1)
 }

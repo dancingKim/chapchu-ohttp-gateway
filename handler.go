@@ -310,7 +310,11 @@ type HTTPClientRequestHandler struct {
 }
 
 func (h HTTPClientRequestHandler) Handle(req *http.Request, metrics Metrics) (*http.Response, error) {
-	return h.client.Do(req)
+	response, err := h.client.Do(req)
+	if err != nil {
+		return nil, GatewayInternalServerError
+	}
+	return boundedResponse(response)
 }
 
 // FilteredHttpRequestHandler represents a HttpRequestHandler that restricts
