@@ -5,7 +5,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -70,11 +70,16 @@ func (s *gatewayResource) gatewayHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxGatewayRequestBytes)
 	defer r.Body.Close()
-	encryptedMessageBytes, err := ioutil.ReadAll(r.Body)
+	encryptedMessageBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		metrics.Fire(metricsResultInvalidContent)
-		s.httpError(w, http.StatusBadRequest, fmt.Sprintf("Reading request body failed"), metrics, r.Method)
+		status := http.StatusBadRequest
+		if _, oversized := err.(*http.MaxBytesError); oversized {
+			status = http.StatusRequestEntityTooLarge
+		}
+		s.httpError(w, status, "Reading request body failed", metrics, r.Method)
 		return
 	}
 
@@ -103,6 +108,10 @@ func (s *gatewayResource) gatewayHandler(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *gatewayResource) legacyConfigHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
 	metrics := s.metricsFactory.Create(metricsEventConfigsRequest)
 
@@ -125,6 +134,10 @@ func (s *gatewayResource) legacyConfigHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (s *gatewayResource) configHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path)
 	metrics := s.metricsFactory.Create(metricsEventConfigsRequest)
 
